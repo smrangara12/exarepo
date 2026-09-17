@@ -86,6 +86,16 @@ EVAL_QUERIES = [
 ]
 
 
+VARIATION_CONTEXTS = {
+    "Baseline": "",
+    "Investor due diligence": "forward revenue growth EPS free cash flow valuation margin customer concentration guidance",
+    "Macro regime": "interest rates inflation recession probability liquidity credit spreads dollar oil market conditions",
+    "Technical implementation": "methods data sources model assumptions evaluation harness benchmark reproducibility",
+    "Risk and counterargument": "risks constraints downside scenario criticism uncertainty sensitivity analysis",
+    "Recent market evidence": "latest data recent report current trend 2026 market expectations",
+}
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     query: str
@@ -174,6 +184,23 @@ def get_api_key() -> str:
 
 def normalize_text(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def generate_query_variations(query: str, selected_contexts: Iterable[str]) -> pd.DataFrame:
+    rows = []
+    clean_query = " ".join(query.split())
+    for context_name in selected_contexts:
+        context_terms = VARIATION_CONTEXTS.get(context_name, "")
+        varied_query = clean_query if not context_terms else f"{clean_query} {context_terms}"
+        rows.append(
+            {
+                "Context": context_name,
+                "Query": varied_query,
+                "Added terms": context_terms,
+                "Token count": len(normalize_text(varied_query)),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -292,6 +319,69 @@ def evaluate_results(df: pd.DataFrame, expected_terms: Iterable[str]) -> pd.Data
     return eval_df
 
 
+def eval_quality_score(eval_df: pd.DataFrame) -> float:
+    if eval_df.empty:
+        return 0.0
+    result_points = {"Pass": 1.0, "Warn": 0.55, "Fail": 0.0}
+    result_score = eval_df["Result"].map(result_points).fillna(0).mean() * 100
+    metric_bonus = 0.0
+    for row in eval_df.itertuples(index=False):
+        if row.Evaluation == "Expected term coverage":
+            metric_bonus += min(float(row.Value), 1.0) * 12
+        elif row.Evaluation == "Source diversity":
+            metric_bonus += min(float(row.Value) / 5, 1.0) * 6
+        elif row.Evaluation == "Top-3 probability mass":
+            metric_bonus += (1 - abs(float(row.Value) - 0.65)) * 5
+    return round(float(np.clip(result_score + metric_bonus, 0, 100)), 2)
+
+
+def run_variation_harness(config: SearchConfig, selected_contexts: Iterable[str], expected_terms: Iterable[str]) -> pd.DataFrame:
+    rows = []
+    variations = generate_query_variations(config.query, selected_contexts)
+    for variation in variations.to_dict("records"):
+        varied_config = SearchConfig(
+            query=variation["Query"],
+            result_count=config.result_count,
+            recency_weight=config.recency_weight,
+            semantic_weight=config.semantic_weight,
+            freshness_half_life_days=config.freshness_half_life_days,
+            use_demo=config.use_demo,
+            api_key=config.api_key,
+        )
+        try:
+            df = results_frame(call_exa_search(varied_config), varied_config)
+            eval_df = evaluate_results(df, expected_terms)
+            top_title = "" if df.empty else str(df.iloc[0]["title"])
+            rows.append(
+                {
+                    "Context": variation["Context"],
+                    "Query": variation["Query"],
+                    "Results": len(df),
+                    "Top probability": round(float(df["probability"].max()) if not df.empty else 0, 3),
+                    "Coverage": float(eval_df.loc[eval_df["Evaluation"] == "Expected term coverage", "Value"].iloc[0]),
+                    "Diversity": float(eval_df.loc[eval_df["Evaluation"] == "Source diversity", "Value"].iloc[0]) if "Source diversity" in set(eval_df["Evaluation"]) else 0,
+                    "Quality score": eval_quality_score(eval_df),
+                    "Eval summary": eval_df["Result"].value_counts().to_dict(),
+                    "Top result": top_title[:120],
+                }
+            )
+        except Exception as error:
+            rows.append(
+                {
+                    "Context": variation["Context"],
+                    "Query": variation["Query"],
+                    "Results": 0,
+                    "Top probability": 0,
+                    "Coverage": 0,
+                    "Diversity": 0,
+                    "Quality score": 0,
+                    "Eval summary": str(error),
+                    "Top result": "",
+                }
+            )
+    return pd.DataFrame(rows).sort_values("Quality score", ascending=False)
+
+
 def run_eval_suite(api_key: str, use_demo: bool) -> pd.DataFrame:
     rows = []
     for case in EVAL_QUERIES:
@@ -360,6 +450,21 @@ def plot_eval(eval_df: pd.DataFrame) -> px.bar:
     return fig
 
 
+def plot_variations(variation_df: pd.DataFrame) -> px.bar:
+    fig = px.bar(
+        variation_df.sort_values("Quality score"),
+        x="Quality score",
+        y="Context",
+        orientation="h",
+        color="Coverage",
+        color_continuous_scale=[[0, PALETTE["red"]], [0.55, PALETTE["amber"]], [1, PALETTE["green"]]],
+        title="Query variation quality by context",
+        hover_data=["Top probability", "Diversity", "Results"],
+    )
+    fig.update_layout(xaxis_title="Quality score", yaxis_title="", margin=dict(l=20, r=20, t=60, b=20))
+    return fig
+
+
 def get_config() -> SearchConfig:
     st.sidebar.header("Exa Search")
     api_key = get_api_key()
@@ -409,13 +514,24 @@ def main() -> None:
         st.error(f"Search failed: {error}")
         st.stop()
 
-    metric_cols = st.columns(4)
+    selected_contexts = st.sidebar.multiselect(
+        "Variation contexts",
+        options=list(VARIATION_CONTEXTS.keys()),
+        default=["Baseline", "Investor due diligence", "Macro regime", "Risk and counterargument"],
+    )
+    if not selected_contexts:
+        selected_contexts = ["Baseline"]
+    variation_df = run_variation_harness(config, selected_contexts, expected_terms)
+    best_context = variation_df.iloc[0]["Context"] if not variation_df.empty else "n/a"
+
+    metric_cols = st.columns(5)
     metric_cols[0].metric("Results", len(df))
     metric_cols[1].metric("Top probability", f"{df['probability'].max():.1%}" if not df.empty else "0.0%")
     metric_cols[2].metric("Eval pass", int((eval_df["Result"] == "Pass").sum()))
-    metric_cols[3].metric("Mode", "Demo" if config.use_demo or not config.api_key else "Live")
+    metric_cols[3].metric("Best context", best_context)
+    metric_cols[4].metric("Mode", "Demo" if config.use_demo or not config.api_key else "Live")
 
-    tabs = st.tabs(["Search", "Probabilities", "Evaluation", "Eval Suite", "Data"])
+    tabs = st.tabs(["Search", "Probabilities", "Variations", "Evaluation", "Eval Suite", "Iteration Guide", "Data"])
 
     with tabs[0]:
         for row in df.itertuples(index=False):
@@ -431,6 +547,18 @@ def main() -> None:
             st.dataframe(df[["rank", "title", "url", "publishedDate", "score", "probability"]], width="stretch", hide_index=True)
 
     with tabs[2]:
+        st.plotly_chart(plot_variations(variation_df), width="stretch")
+        st.dataframe(variation_df, width="stretch", hide_index=True)
+        if not variation_df.empty:
+            best = variation_df.iloc[0]
+            st.markdown(
+                f"<div class='summary'>Best variation: <b>{best['Context']}</b> with quality score "
+                f"<b>{best['Quality score']:.1f}</b>. Use this query when coverage rises without collapsing "
+                f"source diversity or over-concentrating probability mass.</div>",
+                unsafe_allow_html=True,
+            )
+
+    with tabs[3]:
         st.plotly_chart(plot_eval(eval_df), width="stretch")
         st.dataframe(eval_df, width="stretch", hide_index=True)
         st.markdown(
@@ -443,16 +571,51 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-    with tabs[3]:
+    with tabs[4]:
         suite = run_eval_suite(config.api_key, config.use_demo or not bool(config.api_key))
         st.dataframe(suite, width="stretch", hide_index=True)
 
-    with tabs[4]:
+    with tabs[5]:
+        st.subheader("How To Improve Results Over Iterations")
+        st.markdown(
+            """
+            1. Start with a narrow baseline query that states the decision question.
+            2. Add one context at a time: investor due diligence, macro regime, technical evidence, risk, or recency.
+            3. Compare quality score, expected-term coverage, source diversity, and top-3 probability mass.
+            4. Prefer variations that improve coverage while keeping top-3 probability mass below roughly 85%.
+            5. If source diversity falls, remove overly specific brand names or add broader industry language.
+            6. If coverage is low, add missing concepts from the eval terms rather than making the whole query longer.
+            7. Save the winning query and rerun later with live Exa mode to compare stability over time.
+            """
+        )
+        st.subheader("Iteration Template")
+        st.code(
+            """Question:
+Baseline query:
+Context added:
+Expected concepts:
+Best variation:
+What improved:
+What got worse:
+Next query change:
+Decision / research takeaway:""",
+            language="text",
+        )
+
+    with tabs[6]:
         st.dataframe(df, width="stretch", hide_index=True)
+        st.subheader("Variation harness output")
+        st.dataframe(variation_df, width="stretch", hide_index=True)
         st.download_button(
             "Download search results",
             data=df.to_csv(index=False),
             file_name="exa_probabilistic_results.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download variation harness",
+            data=variation_df.to_csv(index=False),
+            file_name="exa_variation_harness.csv",
             mime="text/csv",
         )
 
