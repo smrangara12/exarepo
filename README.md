@@ -56,6 +56,9 @@ Streamlit app executes without exceptions.
 
 Use the app as a search experimentation loop rather than a one-shot query tool.
 
+For a fuller explanation of the pattern, see
+[`docs/context_harness_eval_guide.md`](docs/context_harness_eval_guide.md).
+
 1. Start with a direct baseline query that states the decision question.
 2. Choose variation contexts in the sidebar:
    - `Investor due diligence` adds growth, FCF, valuation, margin, guidance, and customer concentration language.
